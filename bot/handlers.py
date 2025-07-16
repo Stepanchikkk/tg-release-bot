@@ -6,12 +6,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot.storage import get_all_apps, get_app, save_app, delete_app
 from bot.models import App
-from bot.config import ADMIN_ID, GITHUB_TOKEN
+from bot.config import ADMIN_ID, GITHUB_TOKEN, reload_env
 from bot.services import get_latest_release, get_release_assets, check_releases
 from bot.utils import validate_repo, validate_key
 import logging
 import aiohttp
-import io
+import fnmatch
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +101,6 @@ async def help_command(message: Message):
 
 @router.message(Command("adminhelp"))
 async def admin_help_command(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Эта команда доступна только глобальному администратору.")
-        return
     try:
         help_text = (
             "🔐 **Команды для администратора**:\n"
@@ -111,13 +108,31 @@ async def admin_help_command(message: Message):
             "/removeapp <key> - Удалить приложение по ключу\n"
             "/setrepo <key> <owner/repo> - Установить GitHub-репозиторий для приложения\n"
             "/apps - Показать список всех приложений\n"
-            "/checkupdates - Ручная проверка обновлений"
+            "/checkupdates - Ручная проверка обновлений\n"
+            "/reloadenv - Перезагрузить переменные окружения из .env"
         )
         await message.answer(help_text, parse_mode="Markdown")
         logger.info(f"Админ {message.from_user.id} запросил справку по админским командам")
     except Exception as e:
         logger.error(f"Ошибка в команде adminhelp: {e}")
         await message.answer("Произошла ошибка. Попробуйте снова.")
+
+@router.message(Command("reloadenv"))
+async def reload_env_command(message: Message):
+    global GITHUB_TOKEN, ADMIN_ID, BOT_TOKEN
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Эта команда доступна только глобальному администратору.")
+        return
+    try:
+        env_vars = reload_env()
+        BOT_TOKEN = env_vars["BOT_TOKEN"]
+        ADMIN_ID = env_vars["ADMIN_ID"]
+        GITHUB_TOKEN = env_vars["GITHUB_TOKEN"]
+        await message.answer("Переменные окружения успешно перезагружены!")
+        logger.info(f"Админ {message.from_user.id} перезагрузил переменные окружения")
+    except Exception as e:
+        logger.error(f"Ошибка при перезагрузке переменных окружения: {e}")
+        await message.answer("Произошла ошибка при перезагрузке переменных.")
 
 @router.message(Command("addapp"))
 async def add_app(message: Message, state: FSMContext):
@@ -177,7 +192,7 @@ async def process_repo(message: Message, state: FSMContext):
     await state.update_data(repo=repo)
     assets = await get_release_assets(repo)
     if not assets:
-        await message.answer("В последнем релизе нет активов. Введите фильтры для файлов вручную (через запятую, например, '*.apk,*.zip'):")
+        await message.answer("В последнем релизе нет активов. Введите фильтры для файлов вручную (через запятую, например, 'LSPosed-*-riru-release.zip,LSPosed-*-zygisk-release.zip'):")
         await state.set_state(AddAppStates.asset_filters)
     else:
         await state.update_data(available_assets=assets, selected_asset_indices=[])
@@ -208,31 +223,45 @@ async def select_asset(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(AddAppStates.select_assets, F.data == "asset_done")
 async def finish_assets(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    assets = data.get("available_assets", [])
-    selected_indices = data.get("selected_asset_indices", [])
-    if not selected_indices:
-        await callback.message.edit_text("Файлы не выбраны. Введите фильтры для файлов вручную (через запятую, например, '*.apk,*.zip'):")
-        await state.set_state(AddAppStates.asset_filters)
-        return
-    selected_assets = [assets[i] for i in selected_indices]
-    await state.update_data(asset_filters=selected_assets)
-    app = App(
-        key=data["key"],
-        title=data["title"],
-        link=data["link"],
-        repo=data["repo"],
-        asset_filters=selected_assets,
-        subscribers_users=[],
-        subscribers_chats=[],
-        latest_release=None
-    )
-    save_app(app)
-    await callback.message.edit_text(f"Приложение {app.title} успешно добавлено!")
-    apps = get_all_apps()
-    await callback.message.edit_text("Главное меню:", reply_markup=get_main_menu(apps))
-    await state.clear()
-    logger.info(f"Админ {callback.from_user.id} добавил приложение: {app.key}")
+    try:
+        data = await state.get_data()
+        assets = data.get("available_assets", [])
+        selected_indices = data.get("selected_asset_indices", [])
+        if not selected_indices:
+            await callback.message.edit_text("Файлы не выбраны. Введите фильтры для файлов вручную (через запятую, например, 'LSPosed-*-riru-release.zip,LSPosed-*-zygisk-release.zip'):")
+            await state.set_state(AddAppStates.asset_filters)
+            return
+        selected_assets = [assets[i] for i in selected_indices]
+        await state.update_data(asset_filters=selected_assets)
+        # Проверка наличия всех необходимых данных
+        required_keys = ["key", "title", "link", "repo"]
+        if not all(key in data for key in required_keys):
+            missing = [k for k in required_keys if k not in data]
+            await callback.message.edit_text(f"Отсутствуют данные: {', '.join(missing)}. Повторите процесс /addapp.")
+            await state.clear()
+            return
+        app = App(
+            key=data["key"],
+            title=data["title"],
+            link=data["link"],
+            repo=data["repo"],
+            asset_filters=selected_assets,
+            subscribers_users=[],
+            subscribers_chats=[],
+            latest_release=None
+        )
+        save_app(app)
+        await callback.message.edit_text(f"Приложение {app.title} успешно добавлено!")
+        apps = get_all_apps()
+        await callback.message.bot.send_message(callback.message.chat.id, "Главное меню:", reply_markup=get_main_menu(apps))
+        await state.clear()
+        logger.info(f"Админ {callback.from_user.id} добавил приложение: {app.key}")
+    except KeyError as e:
+        logger.error(f"Ошибка в finish_assets: отсутствует ключ {e}")
+        await callback.message.edit_text("Произошла ошибка при добавлении приложения. Проверьте ввод данных.")
+    except Exception as e:
+        logger.error(f"Ошибка в finish_assets: {e}")
+        await callback.message.edit_text("Произошла ошибка при добавлении приложения.")
 
 @router.message(AddAppStates.asset_filters)
 async def process_filters(message: Message, state: FSMContext):
@@ -241,6 +270,12 @@ async def process_filters(message: Message, state: FSMContext):
         await message.answer("Требуется хотя бы один фильтр.")
         return
     data = await state.get_data()
+    required_keys = ["key", "title", "link", "repo"]
+    if not all(key in data for key in required_keys):
+        missing = [k for k in required_keys if k not in data]
+        await message.answer(f"Отсутствуют данные: {', '.join(missing)}. Повторите процесс /addapp.")
+        await state.clear()
+        return
     app = App(
         key=data["key"],
         title=data["title"],
@@ -299,8 +334,9 @@ async def set_repo(message: Message):
         await message.answer("Не удалось получить репозиторий. Убедитесь, что он существует и доступен.")
         return
     app.repo = repo
+    app.asset_filters = []  # Сбрасываем фильтры
     save_app(app)
-    await message.answer(f"Репозиторий для {key} обновлён на {repo}!")
+    await message.answer(f"Репозиторий для {key} обновлён на {repo}! Введите новые фильтры для файлов (через запятую, например, 'LSPosed-*-riru-release.zip,LSPosed-*-zygisk-release.zip'):")
     logger.info(f"Админ {message.from_user.id} установил репозиторий для {key}: {repo}")
 
 @router.message(Command("apps"))
@@ -313,7 +349,7 @@ async def list_apps(message: Message):
         await message.answer("Нет доступных приложений.")
         return
     text = "Приложения:\n" + "\n".join(
-        f"{app.title} ({app.key})\n  Репозиторий: {app.repo}\n  Подписчики: {len(app.subscribers_users)} пользователей, {len(app.subscribers_chats)} чатов\n  Фильтры: {', '.join(app.asset_filters)}"
+        f"{app.title} ({app.key})\n  Репозиторий: {app.repo}\n  Подписчики: {len(app.subscribers_users)} пользователей, {len(app.subscribers_chats)} чатов\n  Фильтры: {', '.join(app.asset_filters) if app.asset_filters else 'Не указаны'}"
         for app in apps
     )
     await message.answer(text)
@@ -374,19 +410,26 @@ async def download_app(callback: CallbackQuery, bot: Bot):
         if not release:
             await callback.message.edit_text("Релизы для этого приложения не найдены.")
             return
+        if not app.asset_filters:
+            await callback.message.edit_text("Фильтры для файлов не указаны. Обновите через /setrepo.")
+            return
         is_subscribed = (
             callback.from_user.id in app.subscribers_users
             if callback.message.chat.type == "private"
             else callback.message.chat.id in app.subscribers_chats
         )
         is_admin = callback.from_user.id == ADMIN_ID
-        sent = False
         headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-        headers["Accept"] = "application/octet-stream"
+        headers["Accept"] = "application/vnd.github+json"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+        await callback.message.delete()  # Удаляем старое сообщение
+        await bot.send_message(callback.message.chat.id, "Отправка файлов...")
+        sent = False
+        caption = f"{app.title}: {release['name']}\n{release.get('body', 'Описание релиза отсутствует.')}"
         async with aiohttp.ClientSession() as session:
             for asset in release['assets']:
-                if any(asset['name'].endswith(f.strip()) for f in app.asset_filters):
-                    asset_url = asset['url']
+                if any(fnmatch.fnmatch(asset['name'], f.strip()) for f in app.asset_filters):
+                    asset_url = asset['browser_download_url']
                     logger.info(f"Загрузка файла: {asset_url} (имя: {asset['name']})")
                     try:
                         async with session.get(asset_url, headers=headers) as resp:
@@ -397,19 +440,20 @@ async def download_app(callback: CallbackQuery, bot: Bot):
                             await bot.send_document(
                                 chat_id=callback.message.chat.id,
                                 document=BufferedInputFile(file_data, filename=asset['name']),
-                                caption=f"{app.title}: {release['name']}\n{release.get('body', 'Описание релиза отсутствует.')}"
+                                caption=caption if not sent else None
                             )
                             sent = True
                             logger.info(f"Отправлен файл {asset['name']} для {app.title} в чат {callback.message.chat.id}")
                     except Exception as e:
-                        logger.error(f"Ошибка при отправке файла {asset['name']}: {e}")
+                        logger.error(f"Ошибка при загрузке файла {asset['name']}: {e}")
                         continue
         if not sent:
-            await callback.message.edit_text("Подходящие файлы для скачивания не найдены или недоступны.")
-        await callback.message.edit_text(f"{app.title}", reply_markup=get_app_menu(app, is_subscribed, is_admin))
+            await bot.send_message(callback.message.chat.id, "Подходящие файлы для скачивания не найдены или недоступны.")
+        else:
+            await bot.send_message(callback.message.chat.id, f"{app.title} (файлы успешно отправлены)", reply_markup=get_app_menu(app, is_subscribed, is_admin))
     except Exception as e:
         logger.error(f"Ошибка при скачивании: {e}")
-        await callback.message.edit_text("Произошла ошибка.")
+        await bot.send_message(callback.message.chat.id, "Произошла ошибка.")
 
 @router.callback_query(F.data.startswith("link:"))
 async def send_link(callback: CallbackQuery):
@@ -425,11 +469,12 @@ async def send_link(callback: CallbackQuery):
             else callback.message.chat.id in app.subscribers_chats
         )
         is_admin = callback.from_user.id == ADMIN_ID
-        await callback.message.edit_text(f"{app.title}\n{app.link}", reply_markup=get_app_menu(app, is_subscribed, is_admin))
+        await callback.message.delete()  # Удаляем старое сообщение
+        await callback.message.bot.send_message(callback.message.chat.id, f"{app.title}\n{app.link}", reply_markup=get_app_menu(app, is_subscribed, is_admin))
         logger.info(f"Отправлена ссылка для {app.title} пользователю {callback.from_user.id}")
     except Exception as e:
         logger.error(f"Ошибка при отправке ссылки: {e}")
-        await callback.message.edit_text("Произошла ошибка.")
+        await callback.message.bot.send_message(callback.message.chat.id, "Произошла ошибка.")
 
 @router.callback_query(F.data.startswith("subscribe:"))
 async def toggle_subscription(callback: CallbackQuery):
@@ -499,7 +544,7 @@ async def delete_app_callback(callback: CallbackQuery):
         delete_app(key)
         await callback.message.edit_text(f"Приложение {key} удалено!")
         apps = get_all_apps()
-        await callback.message.edit_text("Главное меню:", reply_markup=get_main_menu(apps))
+        await callback.message.bot.send_message(callback.message.chat.id, "Главное меню:", reply_markup=get_main_menu(apps))
         logger.info(f"Админ {callback.from_user.id} удалил приложение: {key}")
     else:
         await callback.message.edit_text("Приложение не найдено.")
